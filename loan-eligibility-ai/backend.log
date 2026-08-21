@@ -1,0 +1,21 @@
+INFO:     Will watch for changes in these directories: ['/home/labuser/Desktop/capstone project/loan-eligibility-ai']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [3480] using WatchFiles
+INFO:     Started server process [3482]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+{"asctime": "2026-08-21 05:21:51,533", "levelname": "INFO", "name": "service.coordinator_service", "message": "received request", "request_id": "ffc8b110-2c81-417b-b4d1-1df3c2156a31", "path": "/process"}
+{"asctime": "2026-08-21 05:21:51,536", "levelname": "INFO", "name": "service.coordinator_service", "message": "processed request", "request_id": "ffc8b110-2c81-417b-b4d1-1df3c2156a31", "decision": "Eligible"}
+INFO:     127.0.0.1:34204 - "POST /process HTTP/1.1" 200 OK
+{"asctime": "2026-08-21 05:23:24,256", "levelname": "INFO", "name": "service.coordinator_service", "message": "received request", "request_id": "ea4c9686-7adc-410a-b950-778a08f1fcba", "path": "/process"}
+{"asctime": "2026-08-21 05:23:24,257", "levelname": "INFO", "name": "service.coordinator_service", "message": "processed request", "request_id": "ea4c9686-7adc-410a-b950-778a08f1fcba", "decision": "Not Eligible"}
+INFO:     127.0.0.1:45934 - "POST /process HTTP/1.1" 200 OK
+{"asctime": "2026-08-21 05:24:45,300", "levelname": "INFO", "name": "service.coordinator_service", "message": "received request", "request_id": "0724a341-dee7-49dc-aa93-03dadf145c41", "path": "/process"}
+{"asctime": "2026-08-21 05:24:45,301", "levelname": "INFO", "name": "service.coordinator_service", "message": "processed request", "request_id": "0724a341-dee7-49dc-aa93-03dadf145c41", "decision": "Not Eligible"}
+INFO:     127.0.0.1:57972 - "POST /process HTTP/1.1" 200 OK
+{"asctime": "2026-08-21 05:25:04,811", "levelname": "INFO", "name": "service.coordinator_service", "message": "received request", "request_id": "a6c7d50c-e318-4be7-8f72-e630f67fbd9b", "path": "/process"}
+{"asctime": "2026-08-21 05:25:04,811", "levelname": "INFO", "name": "service.coordinator_service", "message": "processed request", "request_id": "a6c7d50c-e318-4be7-8f72-e630f67fbd9b", "decision": "Not Eligible"}
+INFO:     127.0.0.1:37894 - "POST /process HTTP/1.1" 200 OK
+{"asctime": "2026-08-21 05:31:09,447", "levelname": "INFO", "name": "service.coordinator_service", "message": "received request", "request_id": "90a6c4bd-ca89-4de5-98bd-5001b25c62b8", "path": "/process"}
+{"asctime": "2026-08-21 05:31:09,447", "levelname": "INFO", "name": "service.coordinator_service", "message": "processed request", "request_id": "90a6c4bd-ca89-4de5-98bd-5001b25c62b8", "decision": "Not Eligible"}
+INFO:     127.0.0.1:37870 - "POST /process HTTP/1.1" 200 OK
