@@ -14,20 +14,29 @@ This document provides instructions for working with the Loan Eligibility AI app
 
 ```
 agents/              # Core business logic
-  ├── api.py        # FastAPI server (Uvicorn on :8000)
   ├── coordinator.py  # Main orchestrator agent
   ├── eligibility_agent.py  # Credit scoring & rules
   ├── rag_stub.py   # Evidence retrieval (stub)
-  └── rag_adapters.py  # FAISS/Pinecone integration
+  ├── rag_adapters.py  # FAISS/Pinecone integration
+  ├── chat_agent.py     # Chatbot: safety guard, result intents, FAQ retrieval
+  ├── chat_knowledge.py # Chatbot FAQ knowledge base
+  └── chat_llm.py       # Optional Claude responder (LOAN_CHAT_LLM=1)
+
+service/             # HTTP layer
+  ├── coordinator_service.py  # FastAPI server (Uvicorn on :8000)
+  └── audit.py      # Appends JSON lines to logs/audit.log
 
 schemas/             # Pydantic models
   └── models.py     # Request/response validation
 
 ui/                  # Frontend
-  └── app.py        # Streamlit application
+  └── app.py        # Streamlit application (form + sidebar chat panel)
 
 tests/               # Unit tests
-  └── test_eligibility.py
+  ├── test_eligibility.py
+  ├── test_chat_agent.py
+  ├── test_chat_llm.py
+  └── test_chat_api.py
 
 examples/            # Demonstrations
   └── run_embeddings_demo.py
@@ -42,7 +51,7 @@ examples/            # Demonstrations
 ```bash
 # Terminal 1: Backend
 source .venv/bin/activate
-python -m uvicorn agents.api:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn service.coordinator_service:app --host 0.0.0.0 --port 8000 --reload
 
 # Terminal 2: Frontend
 source .venv/bin/activate
@@ -116,8 +125,31 @@ if credit_score < 650:  # Changed from 700
 3. Test by clicking "Evaluate" and downloading PDF
 4. Check layout with various credit score ranges
 
+#### Task: Add a New Chatbot FAQ Entry
+1. Add an entry to `FAQS` in `agents/chat_knowledge.py` with `id`, `question`,
+   `answer` and `keywords`. Keywords matter: retrieval scores the overlap
+   between the customer's words and the entry text, so include the synonyms a
+   customer would actually type.
+2. Source the answer from `agents/eligibility_agent.py`, not from the README —
+   the code is authoritative on thresholds (credit score **> 700**, not `>=`).
+3. Ask it end to end: `curl -s -X POST localhost:8000/chat -H 'Content-Type:
+   application/json' -d '{"message":"<your question>"}'`
+4. If the answer comes back as the out-of-scope reply, the confidence score fell
+   below `CONFIDENCE_FLOOR` in `agents/chat_agent.py` — add keywords rather than
+   lowering the floor, which would make unrelated questions match.
+5. Add a test in `tests/test_chat_agent.py` asserting on the key fact.
+
+#### Task: Change What the Chatbot Says About a Result
+Result-aware answers ("why was I rejected?", "what is my EMI ratio?") come from
+`ChatAgent._match_intent` / `_answer_intent` in `agents/chat_agent.py`, not from
+the FAQ. Note two invariants:
+- An intent only fires when the message contains a first-person marker, so
+  "how do I improve a credit score" stays a general FAQ question.
+- `_answer_intent` returns `None` when the needed field is missing, which is how
+  the agent knows to reply "no assessment yet" instead of inventing a number.
+
 #### Task: Add New API Endpoint
-1. Add route in `agents/api.py`:
+1. Add route in `service/coordinator_service.py`:
 ```python
 @app.get("/health")
 async def health():
@@ -150,6 +182,18 @@ async def health():
 - Clear schema documentation
 - Type hints for IDE support
 
+### Why the Chatbot Is Rules-First, LLM-Optional
+- The deterministic layer answers every question with no key and no network, so
+  a demo or an offline grader never sees a broken chatbot
+- Exact numbers (EMI ratio, credit score) come from the assessment itself — an
+  LLM adds risk and cost for facts we already hold
+- The LLM is gated on `LOAN_CHAT_LLM`, not on the presence of a credential: the
+  Anthropic SDK also resolves `ANTHROPIC_AUTH_TOKEN` and local CLI profiles, and
+  a stray credential must not silently start billing API calls
+- Any responder failure degrades to the rules answer, so `/chat` still returns
+  `200` when the API is down. Only `ResponderError` is caught — that's why
+  `chat_llm.py` maps every SDK exception onto it
+
 ### Why Multi-Agent Architecture
 - Coordinator orchestrates decision flow
 - EligibilityAgent encapsulates business logic
@@ -175,6 +219,15 @@ Keep colors consistent across:
   lsof -i :8000  # Check what's using port 8000
   kill -9 <PID>  # Kill process
   ```
+
+### Chat Logging and Privacy
+- Never log or audit the raw chat message. `/chat` records the request id, the
+  message *length*, and the FAQ ids that matched — customers do type account
+  details into chat boxes, and `logs/audit.log` is plaintext
+- The chat path never receives the applicant's name; `AssessmentContext` has no
+  `name` field. Keep it that way when adding fields
+- `ChatAgent` blocks messages that look like they carry card/account numbers,
+  PAN, Aadhaar, OTPs or passwords before retrieval or any API call
 
 ### Error Handling
 - API errors return JSON with detail message
@@ -236,10 +289,15 @@ Checklist for any changes:
 ## File Dependencies
 
 **Important relationships:**
-- `schemas/models.py` ← used by `agents/api.py` and `agents/coordinator.py`
-- `agents/api.py` ← calls `agents/coordinator.py`
+- `schemas/models.py` ← used by `service/coordinator_service.py` and `agents/coordinator.py`
+- `service/coordinator_service.py` ← calls `agents/coordinator.py` and `agents/chat_agent.py`
 - `agents/coordinator.py` ← uses `agents/eligibility_agent.py` and `agents/rag_stub.py`
-- `ui/app.py` ← calls `agents/api.py` via HTTP
+- `agents/chat_agent.py` ← uses `agents/chat_knowledge.py` and the
+  `InMemoryVectorRetriever` in `agents/rag_interface.py`
+- `agents/chat_llm.py` ← imports `ResponderError` from `agents/chat_agent.py`
+  (one direction only — `chat_agent.py` must never import `chat_llm.py`, so the
+  agent stays importable without the `anthropic` package)
+- `ui/app.py` ← calls `service/coordinator_service.py` via HTTP at `LOAN_API_BASE`
 - `tests/test_eligibility.py` ← tests `agents/eligibility_agent.py`
 
 **When changing a core module:**
@@ -253,7 +311,7 @@ Checklist for any changes:
 ### Local Development
 ```bash
 source .venv/bin/activate
-python -m uvicorn agents.api:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn service.coordinator_service:app --host 0.0.0.0 --port 8000 --reload
 streamlit run ui/app.py
 ```
 
@@ -271,6 +329,9 @@ streamlit run ui/app.py
 STREAMLIT_SERVER_PORT=8501
 FASTAPI_PORT=8000
 FASTAPI_HOST=0.0.0.0
+LOAN_API_BASE=http://localhost:8000   # backend URL used by ui/app.py
+LOAN_CHAT_LLM=0                       # 1 enables the Claude chatbot mode
+LOAN_CHAT_MODEL=claude-opus-5         # model used when LOAN_CHAT_LLM=1
 ```
 
 ## Future Work Guidelines

@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 from agents.coordinator import CoordinatorAgent
+import html
+import os
 import requests
 import uuid
 from datetime import datetime
@@ -18,6 +20,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas as pdfcanvas
 import time
+
+
+# Backend location — override with LOAN_API_BASE when the service is not local.
+API_BASE = os.getenv("LOAN_API_BASE", "http://localhost:8000")
 
 
 def generate_pdf(data, response, credit_score):
@@ -179,6 +185,120 @@ def get_recommendations(response, credit_score, data):
     return recommendations
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_chat_info():
+    """Ask the backend what the chatbot can do. Degrades quietly if it is down."""
+    try:
+        resp = requests.get(f"{API_BASE}/chat/info", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return {"llm_enabled": False, "suggested_questions": []}
+
+
+def ask_chatbot(question, context, history):
+    """POST one question to /chat. Returns the response dict, or None on error.
+
+    The error message is stored in session state so the sidebar can show it in
+    the same card style the main page uses.
+    """
+    try:
+        resp = requests.post(
+            f"{API_BASE}/chat",
+            json={
+                "message": question,
+                "history": history[-6:],
+                "context": context,
+            },
+            timeout=30,  # an LLM-backed answer is slower than /process
+            headers={"X-Request-ID": str(uuid.uuid4())},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        st.session_state.chat_error = "The assistant took too long to reply. Please try again."
+    except requests.exceptions.ConnectionError:
+        st.session_state.chat_error = (
+            "Cannot reach the assistant. Make sure the backend is running on port 8000."
+        )
+    except requests.RequestException as exc:
+        st.session_state.chat_error = f"Assistant error: {exc}"
+    return None
+
+
+def render_chat_panel():
+    """Sidebar chat panel for basic customer queries."""
+    info = get_chat_info()
+
+    st.markdown("### 💬 Ask the Loan Assistant")
+    badge = "AI-assisted answers" if info.get("llm_enabled") else "Instant answers from our policy guide"
+    st.caption(badge)
+
+    # Transcript is rendered after this run's message is processed, so a new
+    # question and its answer both appear immediately.
+    transcript = st.empty()
+
+    with st.form("chat_form", clear_on_submit=True):
+        question = st.text_input(
+            "Your question",
+            placeholder="e.g. What credit score do I need?",
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Send", use_container_width=True)
+
+    pending = question.strip() if (submitted and question and question.strip()) else None
+
+    if not st.session_state.chat_history:
+        for i, suggestion in enumerate(info.get("suggested_questions", [])):
+            if st.button(suggestion, key=f"chat_suggestion_{i}", use_container_width=True):
+                pending = suggestion
+    elif st.button("🧹 Clear chat", key="chat_clear", use_container_width=True):
+        st.session_state.chat_history = []
+        st.session_state.chat_error = None
+
+    if pending:
+        st.session_state.chat_error = None
+        with st.spinner("Thinking..."):
+            result = ask_chatbot(
+                pending,
+                st.session_state.last_assessment,
+                st.session_state.chat_history,
+            )
+        st.session_state.chat_history.append({"role": "user", "content": pending})
+        if result:
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": result.get("answer", ""),
+                "sources": result.get("sources", []),
+            })
+
+    with transcript.container():
+        if st.session_state.chat_error:
+            st.markdown(
+                f"<div class='error-card'><small>{html.escape(st.session_state.chat_error)}</small></div>",
+                unsafe_allow_html=True,
+            )
+        for msg in st.session_state.chat_history:
+            # Escaped: the transcript is rendered as HTML for styling.
+            body = html.escape(msg["content"]).replace("\n", "<br>")
+            if msg["role"] == "user":
+                st.markdown(
+                    f"<div class='chat-user'><small><b>You</b><br>{body}</small></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"<div class='chat-bot'><small><b>🤖 Assistant</b><br>{body}</small></div>",
+                    unsafe_allow_html=True,
+                )
+                for src in msg.get("sources", []):
+                    with st.expander(f"📖 {src.get('id', 'reference')}"):
+                        st.write(src.get("content", ""))
+
+        if not st.session_state.chat_history and not st.session_state.chat_error:
+            st.caption("Ask about eligibility criteria, your result, or what happens next.")
+
+
 def validate_inputs(name, age, monthly_income, existing_emi, credit_score, loan_amount):
     """Validate all user inputs."""
     errors = []
@@ -239,6 +359,15 @@ if 'form_employment' not in st.session_state:
 if 'form_loan' not in st.session_state:
     st.session_state.form_loan = 0.0
 
+# Chatbot state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'chat_error' not in st.session_state:
+    st.session_state.chat_error = None
+# Latest assessment, so the assistant can explain the customer's own result
+if 'last_assessment' not in st.session_state:
+    st.session_state.last_assessment = None
+
 def reset_form():
     """Reset all form fields"""
     st.session_state.form_name = ""
@@ -287,6 +416,20 @@ st.markdown("""
         border-left: 4px solid #dc3545;
         margin: 10px 0;
     }
+    .chat-user {
+        background-color: #e8ebf7;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border-left: 3px solid #667eea;
+        margin: 6px 0;
+    }
+    .chat-bot {
+        background-color: #f0f2f6;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border-left: 3px solid #28a745;
+        margin: 6px 0;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -324,6 +467,9 @@ with st.sidebar:
     - **Credit Score**: 0-1000 range
     - **Loan Amount**: Requested amount
     """)
+
+    st.divider()
+    render_chat_panel()
 
 # Main content
 st.markdown("### 📝 Enter Your Information")
@@ -476,7 +622,7 @@ if evaluate_button:
                 req_id = str(uuid.uuid4())
                 headers = {"X-Request-ID": req_id}
                 resp = requests.post(
-                    "http://localhost:8000/process",
+                    f"{API_BASE}/process",
                     json=data,
                     timeout=10,
                     headers=headers
@@ -486,6 +632,21 @@ if evaluate_button:
 
                 # Generate PDF
                 pdf_buffer = generate_pdf(data, response, credit_score)
+
+                # Hand the result to the chatbot so it can explain this decision.
+                # Reuses get_recommendations() so the wording stays identical
+                # across the page, the PDF and the assistant. Note: no name —
+                # explaining a result never needs the applicant's identity.
+                st.session_state.last_assessment = {
+                    "decision": response.get("decision"),
+                    "credit_score": data["credit_score"],
+                    "emi_ratio": response.get("emi_ratio"),
+                    "new_emi": response.get("new_emi"),
+                    "age": data["age"],
+                    "employment_type": data["employment_type"],
+                    "reasoning": response.get("reasoning", []),
+                    "recommendations": get_recommendations(response, credit_score, data),
+                }
 
                 # Display results
                 st.divider()

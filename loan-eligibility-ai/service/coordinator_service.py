@@ -8,8 +8,11 @@ This demonstrates how the coordinator can run as a separate process.
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from schemas.models import Application
+from schemas.models import Application, ChatInfoResponse, ChatRequest, ChatResponse
 from agents.coordinator import CoordinatorAgent
+from agents.chat_agent import ChatAgent
+from agents.chat_knowledge import suggested_questions
+from agents.chat_llm import build_responder
 from logging_config import configure_logging
 from service.audit import write_audit
 import uuid
@@ -30,6 +33,10 @@ app.add_middleware(
 )
 
 coord = CoordinatorAgent()
+
+# Built once at import. `build_responder()` returns None unless LOAN_CHAT_LLM
+# is set, in which case the agent answers from its rules engine alone.
+chat_agent = ChatAgent(responder=build_responder())
 
 
 @app.post("/process")
@@ -58,3 +65,44 @@ def process_application(payload: Application, request: Request):
   write_audit(request_id, input_summary, res.get("decision"), res.get("rag_evidence", []))
   logger.info("processed request", extra={"request_id": request_id, "decision": res.get("decision")})
   return res
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(payload: ChatRequest, request: Request):
+  """Answer a basic customer query about eligibility criteria or their result.
+
+  Mirrors `/process`: reads `X-Request-ID` from the headers or generates one,
+  logs it, and writes an audit entry.
+
+  The raw question is never logged or audited — only its length and the FAQ
+  entries that matched. Customers do sometimes type account details into a
+  chat box, and `logs/audit.log` is plaintext.
+  """
+  request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+  logger.info(
+    "received chat request",
+    extra={"request_id": request_id, "path": request.url.path, "message_length": len(payload.message)},
+  )
+
+  context = payload.context.model_dump() if payload.context else None
+  history = [turn.model_dump() for turn in payload.history[-6:]]
+
+  res = chat_agent.answer(payload.message, context=context, history=history)
+
+  write_audit(
+    request_id,
+    {"message_length": len(payload.message), "has_context": context is not None},
+    f"chat:{res['mode']}",
+    res.get("sources", []),
+  )
+  logger.info("answered chat request", extra={"request_id": request_id, "mode": res["mode"]})
+  return res
+
+
+@app.get("/chat/info", response_model=ChatInfoResponse)
+def chat_info():
+  """Report chat capabilities so the UI can render a mode badge and prompts."""
+  return {
+    "llm_enabled": chat_agent.llm_enabled,
+    "suggested_questions": suggested_questions(),
+  }
