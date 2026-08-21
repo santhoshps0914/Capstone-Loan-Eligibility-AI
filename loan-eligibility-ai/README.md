@@ -12,6 +12,7 @@ A full-stack loan eligibility assessment system using multi-agent AI, Streamlit 
 - 💡 Smart recommendation engine providing actionable steps to improve credit profile
 - 📚 RAG/MCP integration for supporting evidence and policy references
 - 🔍 Comprehensive eligibility assessment with detailed reasoning
+- 💬 Customer support chatbot that answers basic queries about the criteria and about the applicant's own result — works offline, with an optional Claude-powered mode
 
 ## Quick Start
 
@@ -44,7 +45,7 @@ pytest -q
 **Terminal 1 - Start FastAPI backend:**
 ```bash
 source .venv/bin/activate
-python -m uvicorn agents.api:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn service.coordinator_service:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Terminal 2 - Start Streamlit frontend:**
@@ -76,7 +77,12 @@ loan-eligibility-ai/
 │   ├── rag_stub.py              # RAG/MCP integration stub
 │   ├── rag_interface.py          # Retriever protocol
 │   ├── rag_adapters.py           # FAISS & Pinecone adapters
-│   └── api.py                    # FastAPI backend service
+│   ├── chat_agent.py             # Customer support chatbot (rules + retrieval)
+│   ├── chat_knowledge.py         # Chatbot FAQ knowledge base
+│   └── chat_llm.py               # Optional Claude responder for the chatbot
+├── service/
+│   ├── coordinator_service.py    # FastAPI backend service
+│   └── audit.py                  # Audit-log writer
 ├── schemas/
 │   ├── __init__.py
 │   └── models.py                 # Pydantic input/output models
@@ -84,7 +90,10 @@ loan-eligibility-ai/
 │   ├── __init__.py
 │   └── app.py                    # Streamlit UI application
 ├── tests/
-│   └── test_eligibility.py        # Unit tests
+│   ├── test_eligibility.py        # Unit tests
+│   ├── test_chat_agent.py         # Chatbot rules & fallback tests
+│   ├── test_chat_llm.py           # Claude responder tests (stubbed client)
+│   └── test_chat_api.py           # /chat endpoint tests
 ├── examples/
 │   └── run_embeddings_demo.py     # RAG adapter demonstrations
 ├── requirements.txt               # Python dependencies
@@ -129,7 +138,123 @@ Display includes:
 - Actionable improvement steps
 - Supporting evidence references
 
+## Customer Support Chatbot
+
+A chat panel in the Streamlit sidebar answers basic customer queries. It runs
+in two layers, so it always works — even with no API key and no internet.
+
+### What it answers
+
+- **Eligibility criteria** — "What credit score do I need?", "What's the maximum
+  EMI-to-income ratio?", "Which employment types are accepted?"
+- **Process questions** — "What does Needs Manual Review mean?", "Is this
+  decision final?", "What documents will I need?"
+- **The applicant's own result** — after an evaluation, "Why does my application
+  need review?", "What is my EMI ratio?", "What should I do to improve my
+  chances?" The answers use the applicant's actual numbers and the same
+  recommendation wording shown on the page and in the PDF.
+
+Anything outside that scope gets a short "I can only help with…" reply plus
+suggested questions, rather than a guess.
+
+### Rules mode (default)
+
+No configuration needed. `ChatAgent` resolves each question in order:
+
+1. **Safety guard** — messages that look like they contain account numbers,
+   card numbers, PAN, Aadhaar, OTPs or passwords get a warning and are never
+   forwarded anywhere.
+2. **Result-aware intents** — questions about the applicant's own assessment are
+   answered exactly from the submitted result. These never call the API.
+3. **FAQ retrieval** — the knowledge base in `agents/chat_knowledge.py` is
+   ranked with the existing `InMemoryVectorRetriever`; a confidence floor keeps
+   weak matches out.
+
+### AI-assisted mode (optional)
+
+With `LOAN_CHAT_LLM=1`, retrieved FAQ snippets and the applicant's result are
+passed to Claude, which rephrases them conversationally. The system prompt
+forbids inventing thresholds or rates, promising approval, and giving
+personalised financial advice.
+
+```bash
+export LOAN_CHAT_LLM=1
+export ANTHROPIC_API_KEY=sk-ant-...        # or run `ant auth login`
+export LOAN_CHAT_MODEL=claude-opus-5       # optional; this is the default
+```
+
+Two deliberate design points:
+
+- **Opt-in by flag, not by key.** The Anthropic SDK also picks up
+  `ANTHROPIC_AUTH_TOKEN` and local CLI profiles, so an unrelated credential in
+  a developer's shell must not silently turn the form into a billed API caller.
+- **Failure is never visible to the customer.** If the API is unreachable,
+  rate-limited, misconfigured, or declines, the request still returns `200`
+  with the deterministic answer and `"mode": "rules"`.
+
+### Privacy
+
+The applicant's **name is never sent** to the chat endpoint — explaining a
+result does not need it. `logs/audit.log` records the request id, the message
+*length*, and which FAQ entries matched — never the question text.
+
 ## API Endpoints
+
+### POST `/chat`
+
+Answer a customer query. `history` and `context` are optional; `context` is the
+applicant's latest assessment.
+
+**Request:**
+```json
+{
+  "message": "Why does my application need review?",
+  "history": [
+    {"role": "user", "content": "What credit score do I need?"},
+    {"role": "assistant", "content": "Above 700."}
+  ],
+  "context": {
+    "decision": "Needs Manual Review",
+    "credit_score": 695,
+    "emi_ratio": 0.41,
+    "new_emi": 15000,
+    "age": 35,
+    "employment_type": "salaried",
+    "reasoning": ["credit_score: FAILED (695) - credit score must exceed 700"],
+    "recommendations": ["Improve your credit score from 695 to above 700"]
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "answer": "'Needs Manual Review' came from these checks:\n- credit_score: FAILED (695) ...",
+  "sources": [
+    {"id": "faq-manual-review", "content": "What does 'Needs Manual Review' mean? ..."}
+  ],
+  "mode": "rules",
+  "suggestions": [
+    "What credit score do I need to be eligible?",
+    "What is the maximum EMI-to-income ratio allowed?",
+    "What does 'Needs Manual Review' mean?"
+  ]
+}
+```
+
+`mode` is `"rules"` for a deterministic answer and `"llm"` when Claude composed
+it. An empty `message` returns `422`.
+
+### GET `/chat/info`
+
+Reports chat capabilities so the UI can render a mode badge and starter prompts.
+
+```json
+{
+  "llm_enabled": false,
+  "suggested_questions": ["What credit score do I need to be eligible?", "..."]
+}
+```
 
 ### POST `/process`
 Process a loan application and return eligibility assessment.
@@ -176,6 +301,11 @@ STREAMLIT_SERVER_PORT=8501          # Streamlit port (default: 8501)
 STREAMLIT_SERVER_ADDRESS=localhost  # Streamlit address
 FASTAPI_HOST=0.0.0.0               # FastAPI host
 FASTAPI_PORT=8000                  # FastAPI port
+
+LOAN_API_BASE=http://localhost:8000 # Backend URL used by the Streamlit UI
+LOAN_CHAT_LLM=0                     # 1 enables the Claude-backed chatbot mode
+LOAN_CHAT_MODEL=claude-opus-5       # Model used when LOAN_CHAT_LLM=1
+ANTHROPIC_API_KEY=                  # Required only when LOAN_CHAT_LLM=1
 ```
 
 ### Streamlit Config
@@ -258,7 +388,11 @@ pytest -q              # Quick test run
 pytest -v             # Verbose output
 pytest tests/          # Run all tests
 pytest tests/test_eligibility.py::test_eligibility_agent  # Specific test
+pytest tests/test_chat_agent.py tests/test_chat_llm.py -v # Chatbot only
 ```
+
+No test makes a network call: the chatbot's optional Claude path is covered
+with stubbed clients and injected fake responders.
 
 ## Troubleshooting
 
@@ -274,7 +408,7 @@ streamlit run ui/app.py --server.port 8501
 ### FastAPI Connection Error
 ```bash
 # Ensure FastAPI is running on port 8000
-python -m uvicorn agents.api:app --host 0.0.0.0 --port 8000
+python -m uvicorn service.coordinator_service:app --host 0.0.0.0 --port 8000
 
 # Check service is responding
 curl http://localhost:8000/docs
@@ -293,6 +427,7 @@ curl http://localhost:8000/docs
 - **Data Validation:** Pydantic (schema validation)
 - **Server:** Uvicorn (ASGI application server)
 - **RAG/Search:** FAISS, Pinecone adapters (optional)
+- **Chatbot:** Rules + FAQ retrieval, with an optional Claude backend via the Anthropic SDK
 - **Testing:** Pytest
 
 ## Project Architecture
@@ -303,8 +438,9 @@ curl http://localhost:8000/docs
 │  - Application form                                 │
 │  - Credit report display                            │
 │  - PDF generation & download                        │
+│  - Sidebar chat panel                               │
 └────────────────┬────────────────────────────────────┘
-                 │ HTTP/JSON
+                 │ HTTP/JSON  (/process, /chat)
                  ▼
 ┌─────────────────────────────────────────────────────┐
 │          FastAPI Backend (Port 8000)                │
@@ -313,14 +449,22 @@ curl http://localhost:8000/docs
 │  - Decision processing                              │
 └────────────────┬────────────────────────────────────┘
                  │
-        ┌────────┴────────┐
-        ▼                 ▼
-┌──────────────────┐  ┌──────────────────┐
-│ Eligibility      │  │ RAG/MCP Client   │
-│ Agent            │  │ (Stub)           │
-│ - Credit scoring │  │ - Evidence       │
-│ - Rules engine   │  │ - Policy lookup  │
-└──────────────────┘  └──────────────────┘
+    ┌────────────┼──────────────────┐
+    ▼            ▼                  ▼
+┌──────────────┐ ┌──────────────┐ ┌────────────────────┐
+│ Eligibility  │ │ RAG/MCP      │ │ Chat Agent         │
+│ Agent        │ │ Client       │ │ - Safety guard     │
+│ - Credit     │ │ (Stub)       │ │ - Result intents   │
+│   scoring    │ │ - Evidence   │ │ - FAQ retrieval    │
+│ - Rules      │ │ - Policy     │ └─────────┬──────────┘
+│   engine     │ │   lookup     │           │ optional
+└──────────────┘ └──────────────┘           ▼
+                                  ┌────────────────────┐
+                                  │ ClaudeResponder    │
+                                  │ (LOAN_CHAT_LLM=1)  │
+                                  │ falls back to      │
+                                  │ rules on any error │
+                                  └────────────────────┘
 ```
 
 ## Performance Notes
